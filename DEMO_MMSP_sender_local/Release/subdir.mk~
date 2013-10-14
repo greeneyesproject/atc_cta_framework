@@ -1,0 +1,27 @@
+################################################################################
+# Automatically-generated file. Do not edit!
+################################################################################
+
+# Add inputs and outputs from these tool invocations to the build variables 
+CPP_SRCS += \
+../brisk_with_lookup.cpp \
+../testbed_sender_local.cpp 
+
+OBJS += \
+./brisk_with_lookup.o \
+./testbed_sender_local.o 
+
+CPP_DEPS += \
+./brisk_with_lookup.d \
+./testbed_sender_local.d 
+
+
+# Each subdirectory must supply rules for building sources it contributes
+%.o: ../%.cpp
+	@echo 'Building file: $<'
+	@echo 'Invoking: GCC C++ Compiler'
+	g++ -I/home/tony/OpenCV/2.4.3/include -I"/home/tony/Scrivania/greeneyes_github/testbed_sender_local/include" -I"/home/tony/Scrivania/greeneyes_github/testbed_framework/includes" -I"/home/tony/Scrivania/greeneyes_github/testbed_framework/thirdparty/agast" -I"/home/tony/Scrivania/greeneyes_github/testbed_framework/thirdparty/agast/include" -I"/home/tony/Scrivania/greeneyes_github/testbed_framework/thirdparty/agast/include/agast" -O3 -Wall -c -fmessage-length=0 -MMD -MP -MF"$(@:%.o=%.d)" -MT"$(@:%.o=%.d)" -o "$@" "$<"
+	@echo 'Finished building: $<'
+	@echo ' '
+
+

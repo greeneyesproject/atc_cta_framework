@@ -1,0 +1,585 @@
+#include <fstream>
+#include <iostream>
+#include <list>
+#include <algorithm>
+#include <stdlib.h>
+
+#include "ImageAcquisition.h"
+#include "VisualFeatureExtraction.h"
+
+#include "VisualFeatureEncoding.h"
+#include "DataTransmission.h"
+#include "VisualFeatureDecoding.h"
+
+#include "opencv2/video/video.hpp"
+
+using namespace std;
+using namespace cv;
+
+
+
+int main(int argc, char ** argv) {
+
+
+	int BRISK_threshold = 80;
+	int maxFeatures = 50; // maximum number of features to be sent
+	bool send_whole_pic = false;
+	int std_H = 480, std_W = 640;
+	float kp_x_offset=0, kp_y_offset=0;
+
+	// Variables for image acquisition and encoding
+	// --------------------------------------------
+	ImageAcquisition *imAcq;
+	Mat imRGB, imGray;
+	vector<uchar> JPEGbuff;//buffer for coding
+
+	// Variables for background subtraction
+	Mat imGray32;     // 32bits-precision image
+	Mat back, back32; // background
+	Mat fore;         // foreground
+	Mat reducedImg;
+
+	// Variables for feature extraction
+	// --------------------------------------------
+	VisualFeatureExtraction *featExtract;
+	featExtract = new VisualFeatureExtraction;
+	string detectorName   = "BRISK";
+	string descriptorName = "BRISK";
+	vector<KeyPoint> kpts; // will contain the keypoints
+	Mat features;          // will contain the feature vectors
+
+	BRISK_detParams detPrms(BRISK_threshold,4);
+	featExtract->setDetector(detectorName, &detPrms); // set the detector
+
+	vector<int> pairs;
+
+	int aux_pairs[BRISK_LENGTH_BITS];
+	ifstream fileRank;
+	if ( BRISK_LENGTH_BITS == 512 ){
+		fileRank.open("brisk/ranking_original_optimized512.bin",ios::in|ios::binary);
+	}
+	else if (BRISK_LENGTH_BITS == 256 ){
+		fileRank.open("brisk/ranking_original_optimized256.bin",ios::in|ios::binary);
+	}
+	fileRank.read((char*)aux_pairs,sizeof(int)*BRISK_LENGTH_BITS);
+	fileRank.close();
+	for(int i=0; i<BRISK_LENGTH_BITS; i++){
+		pairs.push_back(aux_pairs[i]);
+	}
+
+
+	BRISK_descParams descPrms(pairs);
+
+	featExtract->setDescriptor(descriptorName, &descPrms);    // set the descriptor
+
+	// Variables for feature encoding
+	// --------------------------------------------
+	VisualFeatureEncoding encoder;
+	vector< vector<uchar> > kp_bitstream;
+	vector< vector<uchar> > ft_bitstream;
+	vector< int >           num_feats;
+
+	// Variables for data transmission
+	// --------------------------------------------
+	DataTransmission *dataTx;
+	dataTx = new DataTransmission();
+	serial_source src = dataTx->openSerialRADIO("/dev/ttyUSB0",115200,0);
+
+	// Auxiliary variables
+	// --------------------------------------------
+	int imgID = -1;    // image identifier
+	double send_time1; // transmission time
+	double send_time2;
+	bool ackOK;        // check the ACK packet
+	bool cmdOK;		   // check if a command is received
+	actions *opActs = new actions;   // operations
+	commandType curCmd;
+	int imW = 640, imH = 480;
+
+
+
+	// Define operating states
+	// --------------------------------------------
+	enum op_states{
+		WAIT_CMD,
+		BCKG_EXTR,
+		IMG_ACQ,
+		CTA_PROC,
+		ATC_PROC,
+		WAIT_ACK,
+		SEND_CTA_DATA,
+		SEND_ATC_DATA,
+		SEND_COMPLETED,
+		ENDING
+	};
+
+
+	/*
+	 * START MAIN LOOP
+	 * -------------------------------------------------------------------
+	 */
+
+	int curState = WAIT_CMD;  // the initial state
+	int prevState = WAIT_CMD; // the previous state
+
+	imAcq = new ImageAcquisition(0,imW,imH); // set Device 0, resolution imWximH pixels
+
+	while(1){
+
+		// Handling the "WAIT_CMD" state
+		// -----------------------------------------------------------------------
+		if (curState == WAIT_CMD){
+			cout << "Waiting for commands..........." ;
+			cmdOK = false;
+			while(!cmdOK){
+
+				curCmd = dataTx->waitCMD_RADIO(src, opActs, 0);
+
+				if( curCmd == START ){
+					cout << "ok. CMD = START" << endl;
+					cmdOK = true;
+					curState = BCKG_EXTR;
+					prevState = WAIT_CMD;
+				}
+				else if ( curCmd == STOP ){
+					cout << "ok. CMD = STOP" << endl;
+					cmdOK = true;
+					curState = ENDING;
+					prevState = WAIT_CMD;
+				}
+
+			}
+		}
+
+
+		// Handling the "BCKG_EXTR" state
+		// -----------------------------------------------------------------------
+		if (curState == BCKG_EXTR){
+
+			// Extract the background image
+			back32.create(imH,imW,CV_32SC1);
+			back32 = Mat::zeros(imH,imW,CV_32SC1);
+
+			int N_backPics = 10;
+			int counter = N_backPics;
+
+			// take some extra initial picture, and discard them
+			for(int i=0; i<20; i++){
+				imAcq->takePicture(imRGB);
+			}
+
+			cout << "taking background pictures..." << endl;
+			while(counter > 0){
+
+				imAcq->takePicture(imRGB);
+				imAcq->RGB2Gray(imRGB,imGray);
+				imGray.convertTo(imGray32,CV_32SC1);
+				back32 = back32 + imGray32;
+
+				sleep(0.03);
+				counter--;
+
+				if(counter == 0){
+					back32 = back32/N_backPics;
+					back32.convertTo(back,CV_8U);
+				}
+
+			}
+			cout << "ok." << endl;
+
+
+			curState = IMG_ACQ;
+			prevState = BCKG_EXTR;
+
+		}
+
+
+		// Handling the "IMG_ACQ" state
+		// -----------------------------------------------------------------------
+		else if (curState == IMG_ACQ){
+
+			if( opActs->stop_program == true ){
+				curState = WAIT_CMD;
+				prevState = IMG_ACQ;
+			}
+			else{
+				imAcq->takePicture(imRGB);
+				imAcq->RGB2Gray(imRGB,imGray); // convert to grayscale
+
+
+				// Subtract the foreground and identify if an object is present
+				// ------------------------------------------------------------
+					absdiff(imGray,back,fore); // compute the fore-ground image
+
+					int pix_threshold = 8;
+					bool ok1 = false, ok2 = false;
+					long thr_c = pix_threshold * fore.rows;
+					long thr_r = pix_threshold * fore.cols;
+
+					// find horizontal margins
+					bool no_obj_c = false;
+					int min_c=0, max_c=fore.cols-1;
+					Scalar sum_col1, sum_col2;
+
+					while( ok1 == false || ok2 == false ){
+
+						if( ok1 == false ){
+							sum_col1 = sum(fore.col(min_c));
+							if(sum_col1[0]>thr_c){
+								ok1 = true;
+							}
+							else{
+								min_c++;
+							}
+						}
+
+						if( ok2 == false ){
+							sum_col2 = sum(fore.col(max_c));
+							if(sum_col2[0]>thr_c){
+								ok2 = true;
+							}
+							else{
+								max_c--;
+							}
+						}
+
+						if( ok1 == false && ok2 == false && max_c < min_c){
+							ok1 = true;
+							ok2 = true;
+							no_obj_c = true;
+						}
+
+
+					}
+
+
+					// find vertical margins
+					bool no_obj_r = false;
+					int min_r=0, max_r=fore.rows-1;
+					Scalar sum_row1, sum_row2;
+
+					ok1 = false; ok2 = false;
+					while( ok1 == false || ok2 == false ){
+
+						if( ok1 == false ){
+							sum_row1 = sum(fore.row(min_r));
+							if(sum_row1[0]>thr_r){
+								ok1 = true;
+							}
+							else{
+								min_r++;
+							}
+						}
+
+						if( ok2 == false ){
+							sum_row2 = sum(fore.row(max_r));
+							if(sum_row2[0]>thr_r){
+								ok2 = true;
+							}
+							else{
+								max_r--;
+							}
+						}
+
+						if( ok1 == false && ok2 == false && max_r < min_r){
+							ok1 = true;
+							ok2 = true;
+							no_obj_r = true;
+						}
+
+
+					}
+				// ------------------------------------------------------------
+
+
+				// if an object is present...
+				if(no_obj_r==false && no_obj_c==false){
+
+					// ... obtain the reduced image
+					int margin = 60;
+
+					min_c = max( 0 , min_c - margin );
+					max_c = min( imGray.cols-1, max_c + margin );
+					min_r = max( 0, min_r - margin );
+					max_r = min( imGray.rows-1, max_r + margin );
+
+					kp_x_offset = min_c;
+					kp_y_offset = min_r;
+
+					reducedImg = Mat(imGray, Range(min_r, max_r), Range(min_c, max_c));
+
+					// JPEG Compression - CTA (if requested)
+					if ( opActs->cta == true ){
+						curState = CTA_PROC;
+					}
+					else if ( opActs->atc == true ){
+						curState = ATC_PROC;
+					}
+					else{ // if no actions are requested (!?)
+						curState = WAIT_CMD;
+					}
+
+					// Image acquisition
+					imgID++;
+					if(imgID > 15){
+						imgID = 0;
+					}
+					cout << endl << "Taken picture: ImgID =  " << imgID << endl;
+					cout << "Image size: " << reducedImg.rows << " x " << reducedImg.cols << endl;
+
+				}
+				// if no objects are present
+				else{
+
+					// send the no-obj packet (if needed)
+					if (prevState != IMG_ACQ){
+						cout << "No object present" << endl;
+						dataTx->sendNoObjPktRADIO(src);
+					}
+					// remain in the current state (take another picture)
+					curState = IMG_ACQ;
+				}
+
+				prevState = IMG_ACQ;
+
+			}
+
+		}
+
+		// Handling the "CTA_PROC" state
+		// -----------------------------------------------------------------------
+		else if (curState == CTA_PROC){
+
+			cout << "Compressing image.....";
+			if (send_whole_pic){
+				imAcq->compressJPEG(imGray,opActs->jpeg_qf,JPEGbuff);     // JPEG compression
+			}
+			else{
+				imAcq->compressJPEG(reducedImg,opActs->jpeg_qf,JPEGbuff); // JPEG compression
+			}
+
+			cout << "ok" << endl;
+
+			// Send the image info packet
+			dataTx->sendImgInfoRADIO(src,imgID,false);
+
+
+			// Update the state
+			curState = WAIT_ACK;
+			prevState = CTA_PROC;
+
+		}
+
+		// Handling the "ATC_PROC" state
+		// -----------------------------------------------------------------------
+		else if (curState == ATC_PROC){
+
+			int curH;
+			int curW;
+
+			if( send_whole_pic ){
+				curH = std_H;
+				curW = std_W;
+			}
+			else{
+				curH = reducedImg.rows;
+				curW = reducedImg.cols;
+			}
+
+			kp_bitstream.clear();
+			ft_bitstream.clear();
+			num_feats.clear();
+
+			cout << "Extracting features......";
+			// Extract features - ATC
+			featExtract->extractFeatures(reducedImg,&kpts,&features);
+
+			cout << "Features size: " << features.rows << " x " << features.cols << endl;
+
+			// Cut the number of features, if needed
+			cout << "SORTING THE FEATURES..." << endl;
+			featExtract->cutFeatures(kpts,features,maxFeatures);
+			cout << "OK" << endl;
+
+			cout << "ok. Number of Keypoints: " << kpts.size() << endl;
+
+			if (send_whole_pic == 1){
+				// Compensate the coordinate of the keypoints (if the whole image is sent)
+				for(int i=0; i<kpts.size(); i++){
+					kpts[i].pt.x += kp_x_offset;
+					kpts[i].pt.y += kp_y_offset;
+				}
+			}
+
+			// Compute a control value
+			Scalar sf = sum(features);
+			double sk = 0;
+			for(unsigned int i=0; i<kpts.size();i++){
+				sk += (float)round(kpts[i].pt.x * 4)/4.0;
+				sk += (float)round(kpts[i].pt.y * 4)/4.0;
+				sk += (float)round(kpts[i].size * 4)/4.0;
+			}
+			cout << "CONTROL VALUES: " << sf[0] << " , " << sk << endl;
+
+
+			// Create the bitstreams (1 bitstream per packet)
+			int N = 255; // max number of features per bitstream
+			int B = ceil( (float)kpts.size() / (float)N );
+			if ( kpts.size() == 0 ){
+				B = 0;
+			}
+			int beg,end;
+
+			for(int i=0; i<B; i++){
+
+				vector<uchar>    cur_kp_bitstream;
+				vector<uchar>    cur_ft_bitstream;
+
+				beg = i*N;
+				end = min( (int)(unsigned int)kpts.size(), (int)(beg + N) );
+
+				vector<KeyPoint> cur_kpts(&kpts[beg],&kpts[end]);
+				Mat              cur_features = features.rowRange(beg,end);
+
+				num_feats.push_back( (int)cur_kpts.size() );
+
+				// Compress features (if required)
+				if ( opActs->do_compression == true ){
+					encoder.encodeKeyPoints(cur_kpts, cur_kp_bitstream,curW,curH);
+					encoder.encodeBinaryDescriptors(descriptorName, cur_features, cur_ft_bitstream);
+				}
+				else{
+					encoder.encodeKeyPoints(cur_kpts, cur_kp_bitstream,curW,curH);
+					encoder.dummy_encodeBinaryDescriptors(descriptorName, cur_features, cur_ft_bitstream);
+				}
+
+				kp_bitstream.push_back(cur_kp_bitstream);
+				ft_bitstream.push_back(cur_ft_bitstream);
+
+			}
+
+			if(features.rows > 0){
+				// Send the image info packet
+				dataTx->sendImgInfoRADIO(src,imgID,true,opActs->do_compression,descriptorName,features.rows,curW,curH);
+				// Update the state
+				curState = WAIT_ACK; // update the state
+			}
+			else{
+				// Send the no-obj packet
+				dataTx->sendNoObjPktRADIO(src);
+				// Update the state (take another picture)
+				curState = IMG_ACQ;
+
+			}
+			prevState = ATC_PROC;
+
+		}
+
+
+		// Handling the "WAIT_ACK_CTA" state
+		// -----------------------------------------------------------------------
+		else if (curState == WAIT_ACK){
+
+			cout << "Waiting the ACK......";
+			ackOK = false;
+			while(!ackOK){
+				ackOK = dataTx->waitACK_RADIO(src,ACK_REC_INFO,imgID,3);
+				if (!ackOK){
+					cout << "TIMEOUT EXPIRED... requesting a new INFO ACK" << endl;
+					dataTx->reqACK_RADIO(src,ACK_REC_INFO,imgID);
+				}
+			}
+
+			cout << "ok" << endl;
+
+			if (prevState == CTA_PROC)
+				curState = SEND_CTA_DATA;
+			else if (prevState == ATC_PROC)
+				curState = SEND_ATC_DATA;
+
+			prevState = WAIT_ACK;
+
+		}
+
+
+		// Handling the "SEND_CTA_DATA" state
+		// -----------------------------------------------------------------------
+		else if (curState == SEND_CTA_DATA){
+
+			cout << endl << "Sending jpeg bitstream.....";
+			send_time1 = (double)cv::getTickCount();
+			dataTx->sendJpegRADIO(src,imgID,JPEGbuff);
+			send_time1 = ((double)cv::getTickCount() - send_time1)/cv::getTickFrequency();
+			cout << "ok" << endl;
+
+			curState  = SEND_COMPLETED;
+			prevState = SEND_CTA_DATA;
+
+		}
+
+		// Handling the "SEND_ATC_DATA" state
+		// -----------------------------------------------------------------------
+		else if (curState == SEND_ATC_DATA){
+
+			int ctrl;
+			cout << endl << "Sending visual features.....";
+			send_time2 = (double)cv::getTickCount();
+
+			for(unsigned int i=0; i< kp_bitstream.size(); i++){
+				ctrl = dataTx->sendFeaturesRADIO(src,imgID,num_feats[i],kp_bitstream[i],ft_bitstream[i]);
+				cout << "BIT DI CONTROLLO = " << ctrl << endl;
+			}
+			send_time2 = ((double)cv::getTickCount() - send_time2)/cv::getTickFrequency();
+			cout << "ok" << endl;
+			prevState = SEND_ATC_DATA;
+			curState  = SEND_COMPLETED;
+
+		}
+
+		// Handling the "SEND_COMPLETED" state
+		// -----------------------------------------------------------------------
+		else if (curState == SEND_COMPLETED){
+
+			// Wait ACK from receiver (can contain also updated actions)
+			cout << "Send completed. Waiting the ack......";
+
+			ackOK = false;
+			while(ackOK == false){
+				ackOK = dataTx->waitACK_RADIO(src,ACK_REC_IMG,imgID,3,opActs);
+				if (!ackOK){
+					cout << "TIMEOUT EXPIRED... requesting a new ACK" << endl;
+					dataTx->reqACK_RADIO(src,ACK_REC_IMG,imgID);
+				}
+			}
+			cout << "ack ok!" << endl;
+			if (opActs->stop_program){
+				cout << "Ending program requested!!!!" << endl;
+			}
+
+			// print some statistics
+			if ( prevState==SEND_CTA_DATA ) {
+				cout << endl << "STATS: JPEG transmission: " << endl;
+				cout << "STREAM LENGTH: " << JPEGbuff.size() << " bytes  ";
+				cout << "SEND TIME: " << send_time1 << " sec" << endl;
+			}
+			else if ( prevState==SEND_ATC_DATA ){
+				cout << "STATS: FEATURES transmission: " << endl;
+				int stream_length = 0;
+				for(unsigned int i=0; i<kp_bitstream.size(); i++){
+					stream_length += kp_bitstream[i].size() + ft_bitstream[i].size();
+				}
+				cout << "STREAM LENGTH: " << stream_length << " bytes  ";
+				cout << "SEND TIME: " << send_time2 << " sec" << endl << endl << endl;
+			}
+
+
+			// update the state
+			curState = IMG_ACQ;
+			prevState = SEND_COMPLETED;
+
+		}
+
+	}
+
+
+}
